@@ -7,8 +7,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/SergeyMilch/example-label-designation/models"
 
@@ -40,7 +42,7 @@ func makeRequestWithCookie() ([]models.EventData, error) {
 			"fields": [
 				"time"
 			],
-			"direction": "desc"
+			"direction": "DESC"
 		},
 		"limit": 10
 	}`)
@@ -119,67 +121,90 @@ func makeRequestWithCookie() ([]models.EventData, error) {
 }
 
 func saveFactToMySQL(eventData models.EventData) (int, error) {
-	url := os.Getenv("REQ_URL_FACTS")
+	URL := os.Getenv("REQ_URL_FACTS")
 
-	// Отключаем проверку SSL
+	// Подготовка данных для отправки в формате form data
+	data := url.Values{}
+	data.Set("period_start", eventData.Params.Period.Start)
+	data.Set("period_end", eventData.Params.Period.End)
+	data.Set("period_key", eventData.Params.Period.TypeKey)
+	// data.Set("indicator_to_mo_id", strconv.Itoa(eventData.Params.IndicatorToMoID))
+	data.Set("indicator_to_mo_id", "315914")
+	data.Set("value", "1")
+	data.Set("is_plan", "0")
+	data.Set("auth_user_id", "40")
+
+	// Преобразование формата даты
+	formattedTime, err := time.Parse(time.RFC3339, eventData.Time)
+	if err != nil {
+		return 0, err
+	}
+	data.Set("fact_time", formattedTime.Format("2006-01-02"))
+
+	// Формирование supertags в формате JSON
+	supertags := fmt.Sprintf(`[{"tag":{"id": %d, "name": "КТО", "key": "Who", "values_source": 0}, "value": "%s"}]`, eventData.Author.UserID, eventData.Author.UserName)
+	data.Set("supertags", supertags)
+
+	// comment := fmt.Sprintf(`[{"indicator_to_mo_id": %d, "platform": "%s"}]`, eventData.Params.IndicatorToMoID, eventData.Params.Platform)
+	comment := fmt.Sprintf(`[{"indicator_to_mo_id": %s, "platform": "%s"}]`, "315914", eventData.Params.Platform)
+	data.Set("comment", comment)
+
+	// fmt.Println(data)
+
+	// Отключение проверки SSL
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
 	client := &http.Client{Transport: tr}
 
-	// Данные для запроса
-	supertags := fmt.Sprintf(`[{"tag":{"id": %d, "name": "КТО", "key": "Who", "values_source": 0}, "value": "%s"}]`, eventData.Author.UserID, eventData.Author.UserName)
-
-	comment := fmt.Sprintf(`[{"indicator_to_mo_id": %d, "platform": "%s"}]`, eventData.Params.IndicatorToMoID, eventData.Params.Platform)
-
-	payload := fmt.Sprintf(`{
-		"period_start": "%s",
-		"period_end": "%s",
-		"period_key": "%s",
-		"indicator_to_mo_id": %d,
-		"value": %d,
-		"fact_time": "%s",
-		"is_plan": %d,
-		"supertags": %s,
-		"auth_user_id": %d,
-		"comment": "%s"
-	}`, eventData.Params.Period.Start, eventData.Params.Period.End, eventData.Params.Period.TypeKey,
-		eventData.Params.IndicatorToMoID, 1, eventData.Time, 0,
-		supertags,
-		40, comment)
-
-	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
+	// Создание запроса
+	req, err := http.NewRequest("POST", URL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return 0, err
 	}
 
-	// fmt.Println(payload)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
-	req.Header.Add("Content-Type", "application/json")
+	// Добавляем куку
 	req.Header.Add("Cookie", os.Getenv("COOKIE_SESS"))
 
+	// Отправка запроса
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
 
-	// if resp.StatusCode != http.StatusOK {
-	// 	body, _ := io.ReadAll(resp.Body)
-	// 	fmt.Println("Ошибка при запросе. Код:", resp.StatusCode, "Тело:", string(body))
-	// 	return 0, fmt.Errorf("Ошибка при запросе. Код: %d", resp.StatusCode)
-	// }
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Println("Ошибка при запросе. Код:", resp.StatusCode, "Тело:", string(body))
+		return 0, fmt.Errorf("Ошибка при запросе. Код: %d", resp.StatusCode)
+	}
 
-	// Обработка ответа
-	var mysqlResp models.MySQLResponse
-	err = json.NewDecoder(resp.Body).Decode(&mysqlResp)
+	// fmt.Println("Ответ сервера:", resp.Body)
+
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return 0, err
 	}
 
-	// Возвращаем indicator_to_mo_fact_id
-	return mysqlResp.IndicatorToMoFactID, nil
+	// log.Println("Ответ сервера:", string(body))
+
+	var response map[string]interface{}
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		return 0, err
+	}
+
+	indicatorToMoFactID, ok := response["DATA"].(map[string]interface{})["indicator_to_mo_fact_id"].(float64)
+	if !ok {
+		return 0, fmt.Errorf("Не удалось получить indicator_to_mo_fact_id")
+	}
+
+	// log.Println("indicator_to_mo_fact_id:", indicatorToMoFactID)
+
+	return int(indicatorToMoFactID), nil
 }
 
 func loadEnvVariables() {
